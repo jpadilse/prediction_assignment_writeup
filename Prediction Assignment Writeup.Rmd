@@ -1,0 +1,320 @@
+---
+title: "Prediction Assignment Writeup"
+author: "Juan Felipe Padilla Sepulveda"
+date: "Update date: `r format(Sys.time(), '%Y-%m-%d')`"
+output: github_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  cache = FALSE,
+  collapse = TRUE,
+  comment = "#>",
+  dpi = 400,
+  fig.align = "center",
+  fig.asp = 0.618,
+  fig.show = "hold",
+  message = FALSE,
+  out.width = "70%",
+  tidy = "styler",
+  warning = FALSE
+)
+```
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(vip)
+library(skimr)
+library(corrplot)
+library(janitor)
+library(conflicted)
+
+conflict_prefer("filter", "dplyr")
+conflict_prefer("col_factor", "readr")
+
+theme_set(hrbrthemes::theme_ipsum())
+```
+
+# Import data
+
+The first thing we need to do is download the training and testing sets:
+
+```{r, eval = FALSE}
+url_raw_training <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+url_raw_testing <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+download.file(url_raw_training, "raw_training.csv")
+download.file(url_raw_testing, "raw_testing.csv")
+```
+
+Then, we import the data in the appropriate format:
+
+```{r}
+raw_training <- read_csv(
+  "raw_training.csv",
+  col_types = cols(.default = col_character())
+) %>%
+  clean_names()
+
+raw_testing <- read_csv(
+  "raw_testing.csv",
+  col_types = cols(.default = col_character())
+) %>%
+  clean_names()
+```
+
+The data has many columns with many missings values and it is better delete this columns from the analysis. Therefore, only the columns with a proportion of non-missing values greater that 5% are retained: 
+
+```{r}
+valid_var <- raw_training %>%
+  skim() %>%
+  select(skim_type, skim_variable, complete_rate) %>%
+  as_tibble() %>%
+  filter(complete_rate > 0.05) %>%
+  pull(skim_variable)
+
+raw_training %<>%
+  select(all_of(valid_var)) %>%
+  type_convert(
+    cols(
+      .default = col_double(),
+      user_name = col_character(),
+      cvtd_timestamp = col_datetime("%d/%m/%Y %H:%M"),
+      new_window = col_factor(c("yes", "no")),
+      classe = col_factor(c("A", "B", "C", "D", "E"))
+    )
+  ) %>%
+  select(-x1)
+
+raw_testing %<>%
+  select(any_of(valid_var)) %>%
+  type_convert(
+    cols(
+      .default = col_double(),
+      user_name = col_character(),
+      cvtd_timestamp = col_datetime("%d/%m/%Y %H:%M"),
+      new_window = col_factor(c("yes", "no")),
+      classe = col_factor(c("A", "B", "C", "D", "E"))
+    )
+  ) %>%
+  select(-x1)
+```
+
+# Exploratory Data Analysis
+
+The main aspects of each column are show:
+
+```{r}
+raw_training %>%
+  glimpse()
+```
+
+```{r}
+raw_training %>%
+  skim()
+```
+
+Likewise, a correlogram is plotted showing the correlation between all variables:
+
+```{r, fig.asp = 0.9}
+corrplot(
+  raw_training %>%
+    select(where(is.numeric)) %>%
+    cor() %>%
+    abs(),
+  order = "hclust",
+  tl.cex = 0.5,
+  cl.lim = c(0, 1)
+)
+```
+
+# Model
+
+## Splitting
+
+The data is split into training and testing sets, 80% and 20% respectively.
+
+```{r}
+data_split <- initial_split(raw_training, prop = 4/5, strata = classe)
+data_training <- training(data_split)
+data_test <- testing(data_split)
+```
+
+## Preprocessing
+
+The first six variables are identification of each row and we removed from list of predictors. Also, we remove all variables with zero variance, near-zero variance and highly correlated.
+
+```{r}
+main_rec <- recipe(classe ~ ., data_training) %>%
+  update_role(
+    user_name,
+    raw_timestamp_part_1,
+    raw_timestamp_part_2,
+    cvtd_timestamp,
+    new_window,
+    num_window,
+    new_role = "ID"
+  ) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_corr(all_predictors())
+```
+
+The preprocessing steps left only 45 variables for prediction:
+
+```{r}
+prepped_rec <- prep(main_rec, verbose = TRUE, retain = TRUE)
+
+baked_train <- bake(prepped_rec, new_data = NULL)
+
+predictors_model <- baked_train %>%
+  select(
+    any_of(
+      prepped_rec[["var_info"]] %>%
+        filter(role == "predictor") %>%
+        pull(variable)
+    )
+  )
+
+baked_train %>%
+  glimpse()
+```
+
+```{r}
+baked_test <- bake(prepped_rec, new_data = data_test)
+
+baked_test %>%
+  glimpse()
+```
+
+# Specification of the model
+
+We choose a random forest model because out-of-the-box performance. The number of trees is chosen to be ten times the number of predictors (450):
+
+```{r}
+(n_trees <- ncol(predictors_model) * 10)
+
+main_model <- rand_forest(
+  trees = 450,
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine(
+    "ranger",
+    num.threads = parallel::detectCores(),
+    respect.unordered.factors = "order",
+    importance = "impurity"
+  ) %>%
+  set_mode("classification")
+```
+
+```{r}
+model_workflow <- workflow() %>%
+  add_model(main_model) %>%
+  add_recipe(main_rec)
+```
+
+## Hyperparameters tuning
+
+We search for the best values for the the number of features to consider at any given split and the complexity of each tree. Moreover, we use five resamples of the training data and five levels for each hyperparameter:
+
+```{r, eval = FALSE}
+doParallel::registerDoParallel(cores = parallel::detectCores())
+
+folds <- vfold_cv(data_training, v = 5)
+
+main_grid <- grid_regular(
+  finalize(mtry(), predictors_model),
+  min_n(),
+  levels = 5
+)
+
+main_tuning <- model_workflow %>%
+  tune_grid(
+    resamples = folds,
+    grid = main_grid,
+    control = control_grid(save_pred = TRUE),
+    metrics = metric_set(roc_auc)
+  )
+```
+
+```{r}
+main_tuning %>%
+  autoplot()
+```
+
+```{r, fig.asp = 0.9}
+main_best <- main_tuning %>%
+  select_best()
+
+main_pred_val <- main_tuning %>%
+  collect_predictions(parameters = main_best) %>%
+  roc_curve(
+    ".pred_A",
+    ".pred_B",
+    ".pred_C",
+    ".pred_D",
+    ".pred_E",
+    truth = classe
+  ) 
+
+autoplot(main_pred_val)
+```
+
+# Final model
+
+## Performance
+
+We estimate the model with hyperparameters of the best model from previous section:
+
+```{r}
+final_workflow <- model_workflow %>%
+  finalize_workflow(main_best)
+
+last_fit_main <- final_workflow %>%
+  last_fit(data_split)
+```
+
+The metrics for the final model are really good showing an accuracy of 0.99 and area under the curve of 0.99:
+
+```{r}
+last_fit_main %>%
+  collect_metrics()
+```
+
+```{r}
+model_pred <- last_fit_main %>%
+  collect_predictions()
+
+model_pred %>%
+  roc_curve(
+    ".pred_A",
+    ".pred_B",
+    ".pred_C",
+    ".pred_D",
+    ".pred_E",
+    truth = classe
+  ) %>%
+  autoplot()
+```
+
+```{r}
+conf_mat(
+  model_pred,
+  truth = classe,
+  estimate = .pred_class
+) %>%
+  autoplot(type = 'heatmap')
+```
+
+## Feature importance
+
+```{r}
+last_fit_main %>%
+  pluck(".workflow", 1) %>%
+  pull_workflow_fit() %>%
+  vip(num_features = 20)
+```
